@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rio in Heaven — Endless Runner</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: linear-gradient(#cfe8ff, #f6f1ff); font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol'; }
+    .wrap { display: grid; place-items: center; height: 100%; }
+    canvas { background: transparent; border-radius: 16px; box-shadow: 0 8px 30px rgba(0,0,0,0.15); touch-action: manipulation; }
+    .hud { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); display: flex; gap: 16px; align-items: center; background: rgba(255,255,255,0.6); padding: 8px 14px; border-radius: 999px; backdrop-filter: blur(8px); font-weight: 600; }
+    .btns { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); display: none; gap: 12px; }
+    .btns button { padding: 12px 18px; border-radius: 999px; border: none; background: white; box-shadow: 0 6px 20px rgba(0,0,0,.12); font-size: 16px; font-weight: 700; }
+    @media (pointer: coarse) { .btns { display: flex; } }
+    .toast { position: fixed; top: 72px; left: 50%; transform: translateX(-50%); background: rgba(255,255,255,0.85); padding: 10px 14px; border-radius: 10px; font-weight: 600; box-shadow: 0 6px 18px rgba(0,0,0,.12); }
+    .banner{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(255,255,255,0.9);padding:18px 22px;border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.18);font-size:24px;font-weight:800;backdrop-filter:blur(6px);opacity:0;transition:opacity .2s;}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="game" width="900" height="300" aria-label="Rio in Heaven game" role="img"></canvas>
+  </div>
+  <div class="hud" id="hud">
+    <span>Score: <span id="score">0</span></span>
+    <span>Best: <span id="best">0</span></span>
+    <span>␣ / ↑ / W / tap: jump • R: restart</span>
+  </div>
+  <div class="btns">
+    <button id="jumpBtn" aria-label="Jump">Jump</button>
+    <button id="restartBtn" aria-label="Restart">Restart</button>
+  </div>
+  <div class="toast" id="toast">Collect halos. Avoid holes. Very chill ✨</div>
+  <div class="banner" id="banner" aria-live="polite"></div>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  canvas.setAttribute('tabindex','0');
+  try { canvas.focus({ preventScroll: true }); } catch (_) { canvas.focus(); }
+  const W = canvas.width, H = canvas.height;
+
+  // Difficulty knobs
+  let BASE_SPEED = 6.4;             // starting speed
+  let SPEED_STEP = 0.4;             // +0.4 every 10 halos
+  let speed = BASE_SPEED;           // current speed
+  const GRAVITY = 0.52;             // faster fall after jump
+  const JUMP_VELOCITY = -11.2;      // jump strength
+  const COYOTE_MS = 300;            // late-jump grace
+  const HOLE_CHANCE = 0.35;         // hole frequency
+  const HOLE_MIN = 80;
+  const HOLE_MAX = 140;
+  const CLOUD_MIN = 280;
+  const CLOUD_MAX = 600;
+  const HALO_SPAWN_EVERY = 60;
+  const HALO_SPAWN_CHANCE = 0.8;
+
+  // Track
+  const TRACK_Y = 230;
+  const TRACK_H = 26;
+
+  // Game state
+  let segments = [];
+  let halos = [];
+  let score = 0;
+  let best = +localStorage.getItem('rio_best') || 0;
+  let frame = 0;
+  let running = true;
+  let dying = false;         // play a fall animation before restart
+  let deathStart = 0;
+  
+  const cat = {
+    x: 140,
+    y: TRACK_Y - 32,
+    w: 36,
+    h: 32,
+    vy: 0,
+    grounded: true,
+    lastGroundedAt: performance.now(),
+    spin: 0,
+    spinVel: 0
+  };
+
+  // Input
+  function handleKey(e){
+    const isJumpKey = (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW' || e.key === ' ' || e.key === 'ArrowUp' || e.key === 'Up' || e.key === 'w' || e.key === 'W');
+    if (isJumpKey) { jump(); e.preventDefault(); }
+    if (e.key === 'r' || e.key === 'R') { restart(); }
+  }
+  window.addEventListener('keydown', handleKey, { passive: false });
+  document.addEventListener('keydown', handleKey, { passive: false });
+  document.getElementById('jumpBtn').onclick = () => jump();
+  document.getElementById('restartBtn').onclick = () => restart();
+  canvas.addEventListener('pointerdown', () => { canvas.focus(); jump(); });
+
+  function showToast(msg, ms=1600){
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.style.opacity = '1';
+    setTimeout(() => el.style.opacity = '0', ms);
+  }
+  function showBanner(msg, ms=2200){
+    const el = document.getElementById('banner');
+    el.textContent = msg;
+    el.style.opacity = '1';
+    clearTimeout(showBanner._t);
+    showBanner._t = setTimeout(()=>{ el.style.opacity = '0'; }, ms);
+  }
+
+  function rand(a,b){ return Math.random()*(b-a)+a; }
+  function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+
+  function addSegment(type, w){
+    const x = segments.length ? (segments[segments.length-1].x + segments[segments.length-1].w) : 0;
+    segments.push({ type, x, w });
+  }
+  function ensureSegments(){
+    let tail = segments.length ? segments[segments.length-1].x + segments[segments.length-1].w : 0;
+    if (!segments.length) addSegment('cloud', W + 200);
+    while (tail < W * 2){
+      const last = segments[segments.length-1];
+      const makeHole = (last.type === 'cloud') && Math.random() < HOLE_CHANCE;
+      if (makeHole){ const w = rand(HOLE_MIN, HOLE_MAX); addSegment('hole', w); tail += w; }
+      else { const w = rand(CLOUD_MIN, CLOUD_MAX); addSegment('cloud', w); tail += w; }
+    }
+  }
+
+  function updateSegments(){
+    for (const s of segments) s.x -= speed;
+    while (segments.length && segments[0].x + segments[0].w < -50) segments.shift();
+    ensureSegments();
+  }
+
+  function segmentUnder(px){
+    for (const s of segments){ if (px >= s.x && px <= s.x + s.w) return s; }
+    return null;
+  }
+
+  function spawnHalo(){
+    const ahead = rand(W*0.3, W*0.9);
+    const s = segmentUnder(ahead);
+    if (!s || s.type !== 'cloud') return;
+    halos.push({ x: ahead, y: TRACK_Y - 48 - rand(0, 24), r: 10, taken: false });
+  }
+  function updateHalos(){
+    for (const h of halos) h.x -= speed;
+    halos = halos.filter(h => h.x > -40 && !h.taken);
+    if (frame % HALO_SPAWN_EVERY === 0 && Math.random() < HALO_SPAWN_CHANCE) spawnHalo();
+  }
+
+  function jump(){
+    const now = performance.now();
+    const canJump = cat.grounded || (now - cat.lastGroundedAt) < COYOTE_MS;
+    if (!canJump) return;
+    cat.vy = JUMP_VELOCITY;
+    cat.grounded = false;
+  }
+
+  function updateCat(){
+    if (dying) return; // don't update gameplay while dying
+    cat.vy += GRAVITY;
+    cat.y += cat.vy;
+
+    // Ground collision — allow a small slip, then die with animation
+    const footL = segmentUnder(cat.x + 6);
+    const footR = segmentUnder(cat.x + cat.w - 6);
+    const bothOnCloud = (footL && footL.type === 'cloud') && (footR && footR.type === 'cloud');
+    const atGroundY = (cat.y + cat.h) >= TRACK_Y && cat.vy >= 0;
+
+    // If stepping off the edge, allow small drop before dying
+    if (!bothOnCloud && (cat.y + cat.h) > (TRACK_Y + 6)) {
+      die('edge');
+      return; // stop further processing this frame
+    }
+
+    if (bothOnCloud && atGroundY){
+      // land normally
+      cat.y = TRACK_Y - cat.h;
+      cat.vy = 0;
+      if (!cat.grounded){ cat.grounded = true; cat.lastGroundedAt = performance.now(); }
+    } else {
+      // airborne
+      if (cat.grounded){ cat.grounded = false; cat.lastGroundedAt = performance.now(); }
+    }
+
+    // Collect halos
+    for (const h of halos){
+      if (!h.taken && rectCircleOverlap(cat.x, cat.y, cat.w, cat.h, h.x, h.y, h.r)){
+        h.taken = true; score++; updateHUD();
+        const level = Math.floor(score / 10);
+        const newSpeed = BASE_SPEED + level * SPEED_STEP;
+        if (newSpeed !== speed) { speed = newSpeed; showToast('Speed up! 🌟', 900); }
+        if (score % 10 === 0){
+          showBanner(`${score} halos collected - ${score} kisses from Anfas for Ardra 😘!`, 2600);
+        } else {
+          showToast('+1 halo ✨', 800);
+        }
+      }
+    }
+
+    // Fell below screen — also die dramatically
+    if (cat.y > H + 50 && running){
+      die('hole');
+    }
+  }
+
+  function updateHUD(){
+    document.getElementById('score').textContent = score;
+    document.getElementById('best').textContent = best;
+  }
+
+  function rectCircleOverlap(rx, ry, rw, rh, cx, cy, cr){
+    const nx = clamp(cx, rx, rx+rw);
+    const ny = clamp(cy, ry, ry+rh);
+    const dx = cx - nx, dy = cy - ny;
+    return (dx*dx + dy*dy) <= cr*cr;
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+
+    // Heavenly background gradient glow
+    const sky = ctx.createLinearGradient(0,0,0,H);
+    sky.addColorStop(0, '#e6f3ff');
+    sky.addColorStop(1, '#fcf8ff');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0,0,W,H);
+
+    // Subtle stars/sparkles
+    ctx.save();
+    ctx.globalAlpha = 0.25;
+    for (let i=0;i<20;i++){
+      const x = (i*140 + frame*0.3) % (W+40) - 20;
+      const y = 40 + (i*37 % 140);
+      ctx.beginPath(); ctx.arc(x,y,1.5,0,Math.PI*2); ctx.fillStyle = '#ffffff'; ctx.fill();
+    }
+    ctx.restore();
+
+    
+    // Draw track clouds
+    for (const s of segments){
+      if (s.type === 'cloud') drawCloudStrip(s.x, TRACK_Y, s.w, TRACK_H);
+    }
+
+    // Halos
+    for (const h of halos){ drawHalo(h.x, h.y, h.r); }
+
+    // Rio the ginger cat
+    drawRio(cat.x, cat.y, cat.w, cat.h);
+  }
+
+  function drawCloudStrip(x, yTop, w, h){
+    // fluffy top edge
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    const bumps = Math.max(3, Math.floor(w/70));
+    const bumpW = w/bumps;
+    for (let i=0;i<=bumps;i++){
+      const cx = x + i*bumpW;
+      ctx.moveTo(cx, yTop);
+      ctx.arc(cx, yTop, 18, Math.PI, 0);
+    }
+    ctx.fill();
+    // body
+    ctx.fillRect(x, yTop, w, h);
+    // soft shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.05)';
+    ctx.fillRect(x, yTop+h-4, w, 4);
+  }
+
+  function drawHalo(x, y, r){
+    ctx.save();
+    ctx.translate(x,y);
+    ctx.strokeStyle = '#ffd54a';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.ellipse(0,0,r*1.3,r*0.8,0,0,Math.PI*2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawRio(x,y,w,h){
+    ctx.save();
+    ctx.translate(x, y);
+    if (dying){ ctx.translate(w/2, h/2); ctx.rotate(cat.spin||0); ctx.translate(-w/2, -h/2); }
+    // tail
+    ctx.fillStyle = '#f28c28';
+    ctx.fillRect(-8, h*0.4, 10, 6);
+    // body
+    ctx.fillStyle = '#ff9c3a';
+    ctx.fillRect(0, 6, w, h-6);
+    // ears
+    ctx.fillStyle = '#ff9c3a';
+    ctx.beginPath(); ctx.moveTo(6,6); ctx.lineTo(14,-6); ctx.lineTo(20,6); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(w-8,6); ctx.lineTo(w-2,-6); ctx.lineTo(w+4,6); ctx.closePath(); ctx.fill();
+    // face
+    ctx.fillStyle = '#fff'; ctx.fillRect(8, 14, 14, 10);
+    ctx.fillStyle = '#333'; ctx.fillRect(10, 16, 3, 3); ctx.fillRect(18, 16, 3, 3);
+    ctx.fillStyle = '#333'; ctx.fillRect(14, 20, 4, 2);
+    // legs (tiny bounce)
+    const step = (frame%30)/30; const off = Math.sin(step*Math.PI*2)*2;
+    ctx.fillStyle = '#f28c28';
+    ctx.fillRect(6, h-6+off, 6, 6);
+    ctx.fillRect(w-14, h-6-off, 6, 6);
+    ctx.restore();
+  }
+
+  
+  function restart(){
+    // Reset state but keep best score
+    segments = []; halos = []; ensureSegments();
+    score = 0; updateHUD();
+    cat.x = 140; cat.y = TRACK_Y - 32; cat.vy = 0; cat.grounded = true; cat.lastGroundedAt = performance.now();
+    cat.spin = 0; cat.spinVel = 0;
+    running = true; dying = false; frame = 0; speed = BASE_SPEED;
+    showToast('New run! Catch halos ✨');
+  }
+
+  // Main loop
+  function tick(){
+    frame++;
+    if (running){
+      updateSegments();
+      updateHalos();
+      updateCat();
+    } else if (dying){
+      updateDeath();
+    }
+    draw();
+    requestAnimationFrame(tick);
+  }
+
+  // Boot
+  ensureSegments();
+  updateHUD();
+  requestAnimationFrame(tick);
+
+  function die(reason){
+    if (dying) return;
+    dying = true; running = false; deathStart = performance.now();
+    cat.vy = Math.max(2.5, cat.vy + 2);
+    cat.spin = 0; cat.spinVel = 0.28;
+    showBanner('Rio fell! Restarting…');
+    setTimeout(() => { if (dying) restart(); }, 1200);
+  }
+
+  function updateDeath(){
+    // Freeze world; just animate the cat falling
+    cat.vy += GRAVITY * 1.2;
+    cat.y += cat.vy;
+    cat.spin += cat.spinVel;
+    cat.spinVel *= 1.03;
+  }
+})();
+</script>
+</body>
+</html>
